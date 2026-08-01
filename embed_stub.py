@@ -1,151 +1,220 @@
 #!/usr/bin/env python3
-"""
-embed_stub.py — Лёгкий embedding-сервер, совместимый с OpenAI/LiteLLM API.
-Использует character n-gram hashing (без ML-зависимостей).
-Размерность вектора: 768 (как arctic-embed).
+"""OpenAI-compatible deterministic hash embedding fallback.
 
-v1.1 — HARDFENING (2026-06-27):
-  + ThreadingMixIn — многопоточная обработка запросов
-  + Логирование ошибок в /tmp/embed_stub.log
-  + Graceful shutdown по SIGTERM
-  + Memory guard: проверка свободной RAM перед большими запросами
+This is NOT Qwen3-Embedding-8B. It is an offline emergency fallback whose
+vector dimension is configurable and defaults to the user's 4096D contract.
 """
-import json
+from __future__ import annotations
+
 import hashlib
+import json
 import math
 import os
 import re
 import signal
-import sys
 import threading
 import time
-from http.server import HTTPServer, BaseHTTPRequestHandler
-from socketserver import ThreadingMixIn
 from collections import Counter
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from socketserver import ThreadingMixIn
 
-VECTOR_SIZE = 1024  # hardcoded for reindex
-NGRAM_SIZES = [2, 3, 4]
-MAX_TEXT_LEN = 8000
 
-idf_cache = {}
-idf_lock = threading.Lock()
-ERROR_LOG = "/tmp/embed_stub.log"
-
-def stub_log(msg: str) -> None:
+def env_int(name: str, default: int, low: int, high: int) -> int:
     try:
-        with open(ERROR_LOG, "a") as f:
-            f.write(f"{time.strftime('%Y-%m-%dT%H:%M:%S')} EMBED {msg}\n")
-    except Exception: pass
+        return max(low, min(int(os.environ.get(name, str(default))), high))
+    except (TypeError, ValueError):
+        return default
 
-def check_memory(file_size_hint: int = 0) -> bool:
-    try:
-        with open("/proc/meminfo") as f:
-            mem = {}
-            for line in f:
-                parts = line.split(":")
-                if len(parts) == 2:
-                    mem[parts[0].strip()] = int(parts[1].strip().split()[0])
-        total = mem.get("MemTotal", 0)
-        available = mem.get("MemAvailable", 0) or mem.get("MemFree", 0)
-        if total == 0: return True
-        return (available / total) >= 0.15
-    except Exception: return True
 
-# Qwen3-Embedding: retrieval instruction (только для search_query, не для document)
+VECTOR_SIZE = env_int(
+    "EMBED_STUB_VECTOR_SIZE",
+    env_int("MEMORY_WIKI_EMBED_DIMENSIONS", 4096, 8, 16384),
+    8,
+    16384,
+)
+PORT = env_int("EMBED_STUB_PORT", 4000, 1, 65535)
+MAX_TEXT_LEN = env_int("EMBED_STUB_MAX_TEXT_LEN", 12000, 256, 131072)
+MAX_REQUEST_BYTES = env_int("EMBED_STUB_MAX_REQUEST_BYTES", 5_000_000, 1024, 64 * 1024 * 1024)
+NGRAM_SIZES = (2, 3, 4)
+ERROR_LOG = os.environ.get("EMBED_STUB_LOG", "/tmp/embed_stub.log")
 QWEN_QUERY_INSTRUCTION = os.environ.get(
     "QWEN_QUERY_INSTRUCTION",
-    "Retrieve durable personal infrastructure facts, preferences, "
-    "decisions and operational context relevant to the user's request."
+    os.environ.get(
+        "MEMORY_WIKI_QUERY_INSTRUCTION",
+        "Retrieve durable personal infrastructure facts, preferences, decisions "
+        "and operational context relevant to the user's request.",
+    ),
 )
 QWEN_DOCUMENT_PREFIX = os.environ.get(
     "QWEN_DOCUMENT_PREFIX",
-    ""
+    os.environ.get("MEMORY_WIKI_DOCUMENT_PREFIX", ""),
 )
 
-def tokenize(text): return re.findall(r'\w+', text.lower())
-def extract_ngrams(word, n): return [word] if len(word) < n else [word[i:i+n] for i in range(len(word) - n + 1)]
-def hash_ngram(ngram): return int.from_bytes(hashlib.md5(ngram.encode()).digest()[:4], 'big') % VECTOR_SIZE
 
-def text_to_vector(text, idf=None, instruction: str = "", task_type: str = "search_document"):
-    """Векторизация текста с опциональной retrieval-инструкцией.
-    - task_type="search_query": instruction добавляется к тексту
-    - task_type="search_document": текст индексируется без instruction
-    """
-    # Qwen3-style: document prefix для индексации, query instruction для поиска
+def log(message: str) -> None:
+    try:
+        with open(ERROR_LOG, "a", encoding="utf-8") as handle:
+            handle.write(f"{time.strftime('%Y-%m-%dT%H:%M:%S')} EMBED {message}\n")
+    except OSError:
+        pass
+
+
+def memory_ok() -> bool:
+    try:
+        values = {}
+        with open("/proc/meminfo", encoding="utf-8") as handle:
+            for line in handle:
+                key, _, tail = line.partition(":")
+                if tail:
+                    values[key.strip()] = int(tail.strip().split()[0])
+        total = values.get("MemTotal", 0)
+        available = values.get("MemAvailable", 0) or values.get("MemFree", 0)
+        return total == 0 or available / total >= 0.10
+    except Exception:
+        return True
+
+
+def tokenize(text: str) -> list[str]:
+    return re.findall(r"\w+", text.lower(), flags=re.UNICODE)
+
+
+def ngrams(word: str, size: int):
+    if len(word) < size:
+        yield word
+        return
+    for index in range(len(word) - size + 1):
+        yield word[index:index + size]
+
+
+def bucket(value: str) -> int:
+    digest = hashlib.blake2b(value.encode("utf-8"), digest_size=8).digest()
+    return int.from_bytes(digest, "big") % VECTOR_SIZE
+
+
+def text_to_vector(text: str, *, instruction: str = "", task_type: str = "search_document") -> list[float]:
     if task_type == "search_query" and instruction:
         text = instruction + "\n\n" + text
     elif task_type == "search_document" and QWEN_DOCUMENT_PREFIX:
         text = QWEN_DOCUMENT_PREFIX + text
-    words = tokenize(text)
-    if not words: return [0.0] * VECTOR_SIZE
-    ngram_counts = Counter()
-    for word in words:
-        for n in NGRAM_SIZES:
-            for ng in extract_ngrams(word, n): ngram_counts[ng] += 1
-    if not ngram_counts: return [0.0] * VECTOR_SIZE
+
+    counts: Counter[str] = Counter()
+    for word in tokenize(text):
+        for size in NGRAM_SIZES:
+            counts.update(ngrams(word, size))
+    if not counts:
+        return [0.0] * VECTOR_SIZE
+
     vector = [0.0] * VECTOR_SIZE
-    max_tf = max(ngram_counts.values())
-    for ng, count in ngram_counts.items():
-        idx = hash_ngram(ng)
-        tf = count / max_tf
-        if idf and ng in idf: tf *= idf[ng]
-        vector[idx] += tf
-    norm = math.sqrt(sum(v * v for v in vector))
-    if norm > 0: vector = [v / norm for v in vector]
+    maximum = max(counts.values())
+    for gram, count in counts.items():
+        vector[bucket(gram)] += count / maximum
+    norm = math.sqrt(sum(value * value for value in vector))
+    if norm:
+        vector = [value / norm for value in vector]
     return vector
 
-class ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
-    allow_reuse_address = True; daemon_threads = True
 
-class EmbedHandler(BaseHTTPRequestHandler):
-    def log_message(self, fmt, *args):
-        if args and len(args) >= 2 and isinstance(args[1], int) and args[1] >= 400:
-            stub_log(f"HTTP {args[1]} {self.path}")
-    def _send_json(self, data, status=200):
-        body = json.dumps(data, ensure_ascii=False).encode()
+class ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
+    allow_reuse_address = True
+    daemon_threads = True
+
+
+class Handler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, _format, *_args):
+        return
+
+    def send_json(self, value, status=200):
+        body = json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
+        self.send_header("Connection", "close")
         self.end_headers()
-        try: self.wfile.write(body)
-        except Exception: pass
-    def _read_body(self):
-        length = int(self.headers.get("Content-Length", 0))
-        if length == 0: return {}
-        if length > 5_000_000: stub_log(f"BODY_TOO_LARGE {length}b"); return {}
-        try: return json.loads(self.rfile.read(length))
-        except Exception as e: stub_log(f"JSON_PARSE_ERROR {e}"); return {}
+        self.wfile.write(body)
+
+    def read_json(self):
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            raise ValueError("Invalid Content-Length")
+        if length < 0 or length > MAX_REQUEST_BYTES:
+            raise ValueError(f"Request body exceeds {MAX_REQUEST_BYTES} bytes")
+        if not length:
+            return {}
+        value = json.loads(self.rfile.read(length))
+        if not isinstance(value, dict):
+            raise ValueError("JSON body must be an object")
+        return value
+
     def do_GET(self):
-        if self.path == "/health": return self._send_json({"status": "ok", "version": "1.1"})
-        self._send_json({"error": "Not found"}, 404)
+        if self.path == "/health":
+            self.send_json({
+                "status": "ok",
+                "version": "2.0-4096-contract",
+                "backend": "hash-ngram-fallback",
+                "vector_size": VECTOR_SIZE,
+                "model": f"hash-ngram-{VECTOR_SIZE}",
+                "warning": "offline fallback; not qwen/qwen3-embedding-8b",
+            })
+            return
+        self.send_json({"error": "Not found"}, 404)
+
     def do_POST(self):
-        if self.path in ("/v1/embeddings", "/embeddings"):
-            if not check_memory(): return self._send_json({"error": "Server under memory pressure, retry later"}, 503)
-            body = self._read_body()
-            texts = body.get("input", "")
-            if isinstance(texts, list): pass
-            else: texts = [str(texts)]
-            texts = [str(t)[:MAX_TEXT_LEN] for t in texts]
-            task_type = body.get("task_type", body.get("input_type", "search_document"))
-            instruction = body.get("instruction", "")
+        if self.path not in ("/v1/embeddings", "/embeddings"):
+            self.send_json({"error": "Not found"}, 404)
+            return
+        try:
+            if not memory_ok():
+                self.send_json({"error": "Server under memory pressure"}, 503)
+                return
+            body = self.read_json()
+            raw_input = body.get("input", "")
+            texts = raw_input if isinstance(raw_input, list) else [raw_input]
+            texts = [str(item)[:MAX_TEXT_LEN] for item in texts]
+            task_type = str(body.get("task_type", body.get("input_type", "search_document")))
+            instruction = str(body.get("instruction") or "")
             if task_type == "search_query" and not instruction:
                 instruction = QWEN_QUERY_INSTRUCTION
-            with idf_lock: current_idf = dict(idf_cache) if idf_cache else None
-            embeddings = []
-            for text in texts:
-                try: embeddings.append(text_to_vector(text, idf=current_idf, instruction=instruction, task_type=task_type))
-                except Exception as e: stub_log(f"VECTORIZE_ERROR {e}"); embeddings.append([0.0] * VECTOR_SIZE)
-            return self._send_json({"object": "list", "data": [{"object": "embedding", "index": i, "embedding": emb} for i, emb in enumerate(embeddings)], "model": body.get("model", "arctic-embed"), "usage": {"prompt_tokens": sum(len(re.findall(r'\w+', t.lower())) for t in texts), "total_tokens": sum(len(re.findall(r'\w+', t.lower())) for t in texts)}})
-        self._send_json({"error": "Not found"}, 404)
+            embeddings = [
+                text_to_vector(text, instruction=instruction, task_type=task_type)
+                for text in texts
+            ]
+            token_estimate = sum(len(tokenize(text)) for text in texts)
+            self.send_json({
+                "object": "list",
+                "data": [
+                    {"object": "embedding", "index": index, "embedding": embedding}
+                    for index, embedding in enumerate(embeddings)
+                ],
+                "model": body.get("model") or f"hash-ngram-{VECTOR_SIZE}",
+                "usage": {"prompt_tokens": token_estimate, "total_tokens": token_estimate},
+            })
+        except ValueError as exc:
+            log(f"BAD_REQUEST {exc}")
+            self.send_json({"error": str(exc)}, 400)
+        except Exception as exc:
+            log(f"ERROR {type(exc).__name__}: {exc}")
+            self.send_json({"error": "Internal server error"}, 500)
 
-def run(port=4000):
-    server = ThreadingHTTPServer(("127.0.0.1", port), EmbedHandler)
-    print(f"Embed stub v1.1: http://127.0.0.1:{port}")
-    def shutdown(signum, frame): stub_log("SHUTDOWN"); server.shutdown()
-    signal.signal(signal.SIGTERM, shutdown)
-    stub_log(f"START port={port}")
-    try: server.serve_forever()
-    except KeyboardInterrupt: pass
-    finally: server.server_close(); stub_log("STOPPED")
 
-if __name__ == "__main__": run()
+def main() -> int:
+    server = ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
+
+    def stop(_signum, _frame):
+        threading.Thread(target=server.shutdown, daemon=True).start()
+
+    signal.signal(signal.SIGTERM, stop)
+    signal.signal(signal.SIGINT, stop)
+    log(f"START port={PORT} vector_size={VECTOR_SIZE}")
+    try:
+        server.serve_forever(poll_interval=0.25)
+    finally:
+        server.server_close()
+        log("STOP")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
