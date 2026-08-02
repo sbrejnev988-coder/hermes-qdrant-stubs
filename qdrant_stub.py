@@ -725,6 +725,16 @@ class QdrantHandler(BaseHTTPRequestHandler):
             heap: list[tuple[float, int, str, dict[str, Any]]] = []
             sequence = 0
             for point_id, vector_blob, payload_json in iter_collection_points(resolved):
+                # R12: reject non-matching tenant/model/context payloads before
+                # unpacking a 4096-dimensional vector and computing cosine.
+                # This preserves exact Qdrant semantics while avoiding the most
+                # expensive work for points excluded by the request filter.
+                try:
+                    payload = json.loads(payload_json) if payload_json else {}
+                except json.JSONDecodeError:
+                    payload = {}
+                if not _payload_matches_filter(payload, payload_filter):
+                    continue
                 try:
                     candidate = unpack_vector(vector_blob)
                     if len(candidate) != size:
@@ -732,12 +742,6 @@ class QdrantHandler(BaseHTTPRequestHandler):
                     score = cosine_similarity(query, candidate)
                 except Exception as exc:
                     stub_log(f"CORRUPT_VECTOR collection={resolved} id={point_id} error={exc}")
-                    continue
-                try:
-                    payload = json.loads(payload_json) if payload_json else {}
-                except json.JSONDecodeError:
-                    payload = {}
-                if not _payload_matches_filter(payload, payload_filter):
                     continue
                 if score_threshold is not None and score < score_threshold:
                     continue
